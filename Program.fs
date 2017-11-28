@@ -1,6 +1,4 @@
-﻿// Learn more about F# at http://fsharp.org
-
-open System
+﻿open System
 open Suave
 open System.Net
 open Suave.Tcp
@@ -13,6 +11,7 @@ open Suave.Logging.Message
 
 let logger = Suave.Logging.Log.create "Suave.Smtp"
 
+/// A record representing a Mail message built up in an SMTP transaction.
 type Mail = {
     From : string
     To : string list
@@ -22,11 +21,13 @@ type Mail = {
     Body : string option
 }
 
+/// A session with an SMTP client.
 type Session = {
     Client:string option
     Message:Mail option
 }
 
+/// A context for processing an SMTP operation.
 type SmtpContext = {
     Session : Session
     Send : string -> SocketOp<unit>
@@ -34,6 +35,7 @@ type SmtpContext = {
     Shutdown : Async<unit>
 }
 
+/// Between active pattern for parsing SMTP commands
 let (|Between|_|) (ends:string*string) (s:string) =
     let start, finish = ends
     if s.StartsWith (start, StringComparison.InvariantCultureIgnoreCase) 
@@ -42,12 +44,14 @@ let (|Between|_|) (ends:string*string) (s:string) =
     else
         None
 
+/// StartsWith active pattern for parsing headers in DATA contents.
 let (|StartsWith|_|) (start:string) (s:string) =
     if s.StartsWith (start, StringComparison.InvariantCultureIgnoreCase) then
         s.Substring(start.Length).TrimStart() |> Some
     else
         None
 
+/// SMTP protocol operations
 type OperationType = 
     | Hello of Client:string
     | Continue of string
@@ -66,6 +70,7 @@ let minimalMessage sender = {
     Body=None
 }
 
+/// Parsing each supported SMTP operation.
 let lineProcessor =
     function
     | "QUIT\r\n" -> End
@@ -94,6 +99,7 @@ let private printIfSocketError =
 let private getHostName =
     lazy (System.Net.Dns.GetHostName ())
 
+/// Processing each supported SMTP operation with a context for sending and receiving data.
 let processSmtpOperation context operation : Async<SmtpContext option>=
     match operation with
     | End ->
@@ -156,12 +162,12 @@ let processSmtpOperation context operation : Async<SmtpContext option>=
             | Some _, Some message ->
                 let! res = "354 Start mail input; end with <CRLF>.<CRLF>" |> context.Send
                 res |> printIfSocketError
+                /// A bit complicated here, the SMTP DATA operation semantics mean parsing between CRLFs.
                 let readEntireBody message = async {
                     let! readBody = context.Read ()
                     match readBody with
                     | Ok entireBody ->
                         let bodyList = entireBody.Split("\r\n", StringSplitOptions.None) |> List.ofArray
-                        let bodyArray = bodyList |> Array.ofList
                         let rec processBody (bodyList:string list) processingHeaders m =
                             match bodyList with
                             | [] -> m
@@ -203,6 +209,7 @@ let processSmtpOperation context operation : Async<SmtpContext option>=
             return context |> Some
         }
 
+/// Start a mail server, passing the function to serve each TCP client.  Binding hardcoded for now.
 let startMailServerAsync (config:SuaveConfig) =
     let ip = IPAddress.Parse("0.0.0.0")
     let port = 1025us
@@ -211,15 +218,18 @@ let startMailServerAsync (config:SuaveConfig) =
         config.tcpServerFactory.create(
           config.maxOps, config.bufferSize, config.autoGrow,
           socketBinding)
+    /// Handles each client connection
     let serveClient (conn:Suave.Sockets.Connection) =
         async {
             logger.info (eventX "Got socket conn: {binding}" >> setFieldValue "binding" conn)
+            /// send function, which appends CRLF and sends as ASCII.
             let send (s:string) =
                 s |> sprintf "%s\r\n"
                 |> System.Text.Encoding.ASCII.GetBytes
                 |> ArraySegment
                 |> conn.transport.write
             let buffer = ArraySegment (Array.zeroCreate 256)
+            /// buffered read function.
             let read () =
                 let sb = System.Text.StringBuilder ()
                 let rec readMore () =
@@ -237,17 +247,20 @@ let startMailServerAsync (config:SuaveConfig) =
                             return Result.Error err
                     }
                 readMore ()
+            /// the context for the TCP session.
             let context = {
                 Session = { Client=None; Message=None }
                 Send = send
                 Read = read
                 Shutdown = async { do! conn.transport.shutdown () }
             }
+            /// Say hello to the client
             let! headerRes =
                 getHostName.Value
                 |> sprintf "220 %s Suave SMTP Server"
                 |> send
             headerRes |> printIfSocketError
+            /// Then start looping
             let rec loop (context:SmtpContext) = async {
                 let! msg = read ()
                 let operation =
@@ -274,4 +287,4 @@ let main argv =
     Async.Start (server, cts.Token)
     System.Runtime.Loader.AssemblyLoadContext.Default.add_Unloading (fun _ -> cts.Cancel (); wait.Set ())
     wait.Wait()
-    0 // return an integer exit code
+    0
